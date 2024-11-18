@@ -1,7 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+
 use anyhow::{Context, Result};
-use bytes::BufMut as _;
 use bytes::BytesMut;
+use bytes::{BufMut as _, Bytes};
 use clap::{crate_name, crate_version, App, AppSettings};
 use env_logger::Env;
 use futures::future::join_all;
@@ -12,6 +13,21 @@ use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+use alloy::primitives::{
+    utils::{format_units, parse_units},
+    Address,
+};
+use alloy::transports::http::reqwest::Url;
+use alloy::{
+    network::{EthereumWallet, TransactionBuilder},
+    primitives::U256,
+    providers::{Provider, ProviderBuilder, WalletProvider},
+    rpc::types::TransactionRequest,
+};
+use alloy_primitives::address;
+use alloy_signer::Signer;
+use alloy_signer_local::{coins_bip39::English, MnemonicBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -102,10 +118,24 @@ impl Client {
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
-        let mut r = rand::thread_rng().gen();
+        //let mut r = rand::thread_rng().gen();
         let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
         let interval = interval(Duration::from_millis(BURST_DURATION));
         tokio::pin!(interval);
+        let value = parse_units("1", "wei")?;
+        let txx = TransactionRequest::default()
+            .with_to(address!("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"))
+            .with_nonce(1000)
+            .with_chain_id(1337)
+            .with_value(value.into())
+            .with_gas_limit(21_000)
+            .with_max_priority_fee_per_gas(1_000_000_000)
+            .with_max_fee_per_gas(20_000_000_000);
+
+        let ss = serde_json::to_string(&txx)?;
+        // let bb = Bytes::from(ss.clone());
+        let bb = ss.as_bytes();
+        info!("tx len: {}", ss.len());
 
         // NOTE: This log entry is used to compute performance.
         info!("Start sending transactions");
@@ -122,9 +152,10 @@ impl Client {
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64(counter); // This counter identifies the tx.
                 } else {
-                    r += 1;
-                    tx.put_u8(1u8); // Standard txs start with 1.
-                    tx.put_u64(r); // Ensures all clients send different txs.
+                    // r += 1;
+                    // tx.put_u8(1u8); // Standard txs start with 1.
+                    // tx.put_u64(r); // Ensures all clients send different txs.
+                    tx.put_slice(bb);
                 };
 
                 tx.resize(self.size, 0u8);

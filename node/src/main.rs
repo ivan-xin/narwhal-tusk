@@ -1,14 +1,20 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+
+use std::time::Duration;
+use alloy_primitives::private::serde;
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
+use crypto::Digest;
 use env_logger::Env;
+use log::info;
 use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
+use tokio::time::sleep;
 use worker::Worker;
 
 /// The default channel capacity.
@@ -127,15 +133,96 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     }
 
     // Analyze the consensus' output.
-    analyze(rx_output).await;
+    analyze(rx_output, store_path.parse()?).await;
 
     // If this expression is reached, the program ends and all other tasks terminate.
     unreachable!();
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>) {
-    while let Some(_certificate) = rx_output.recv().await {
-        // NOTE: Here goes the application logic.
+async fn analyze(mut rx_output: Receiver<Certificate>, store_path: String) {
+    loop {
+        tokio::select! {
+                Some(certificate) = rx_output.recv() => {
+                    info!("rx_output len: {}", rx_output.len());
+                    let store_path = store_path.clone();
+                    tokio::spawn(async move {
+                        handle_cert(certificate, store_path).await.expect("handle_cert panic");
+                    });
+                },
+                else => {
+                    println!("loop exit!!!");
+                    break;
+                },
+            }
     }
+}
+async fn reconstruct_batch(
+    digest: Digest,
+    worker_id: u32,
+    store_path: String,
+) -> eyre::Result<Vec<u8>> {
+    let max_attempts = 3;
+    let backoff_ms = 500;
+    let db_path = format!("{}-{}", store_path, worker_id);
+    // Open the database to each worker
+    let db = rocksdb::DB::open_for_read_only(&rocksdb::Options::default(), db_path, true)?;
+
+    for attempt in 0..max_attempts {
+        // Query the db
+        let key = digest.to_vec();
+        match db.get(&key)? {
+            Some(res) => return Ok(res),
+            None if attempt < max_attempts - 1 => {
+                println!(
+                    "digest {} not found, retrying in {}ms",
+                    digest,
+                    backoff_ms * (attempt + 1)
+                );
+                sleep(Duration::from_millis(backoff_ms * (attempt + 1))).await;
+                continue;
+            }
+            None => eyre::bail!(
+                "digest {} not found after {} attempts",
+                digest,
+                max_attempts
+            ),
+        }
+    }
+    unreachable!()
+}
+async fn handle_cert(certificate: Certificate, store_path: String) -> eyre::Result<()> {
+    // Reconstruct batches from certificate
+    let futures: Vec<_> = certificate
+        .header
+        .payload
+        .into_iter()
+        .map(|(digest, worker_id)| reconstruct_batch(digest, worker_id, store_path.clone()))
+        .collect();
+
+    let batches = futures::future::join_all(futures).await;
+
+    for batch in batches {
+        let batch = batch?;
+        process_batch(batch).await?;
+    }
+    Ok(())
+}
+
+async fn process_batch(batch: Vec<u8>) -> eyre::Result<()> {
+    // Deserialize and process the batch
+    match bincode::deserialize(&batch) {
+        Ok(WorkerMessage::Batch(txs)) => {
+            info!("txs len: {}", txs.len());
+            Ok(())
+        }
+        _ => eyre::bail!("Unrecognized message format"),
+    }
+}
+
+pub type Transaction = Vec<u8>;
+pub type Batch = Vec<Transaction>;
+#[derive(serde::Deserialize)]
+pub enum WorkerMessage {
+    Batch(Batch),
 }
